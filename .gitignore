@@ -1,0 +1,6 @@
+protocol/rfs_pb2.py
+protocol/rfs.pb.h
+protocol/rfs.pb.c
+brew/
+firmware/.pio
+protocol/__pycache__

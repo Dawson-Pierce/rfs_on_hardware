@@ -1,0 +1,94 @@
+syntax = "proto3";
+
+package rfs;
+
+import "nanopb.proto";
+
+// Wire framing:
+//   [u8 type][u16 seq][u16 len][payload bytes]
+// `type` selects which protobuf message the host or MCU should decode from
+// `payload`. type values mirror the rfs_msg_type C enum at the application
+// layer (PING=1, PONG=2, RESET=3, CONFIG=4, STEP=5, TRACKS=6, LOG=7, ERROR=127).
+// PING / PONG / RESET use empty payloads; the others use the messages below.
+
+enum FilterKind {
+  FILTER_GM_PHD     = 0;
+  FILTER_GGIW_PHD   = 1;
+  FILTER_TST_GM_PHD = 2;
+}
+
+message Config {
+  FilterKind filter_kind = 1;
+  uint32 state_dim = 2;
+  uint32 meas_dim  = 3;
+  float dt = 4;
+  float prob_detection = 5;
+  float prob_survive   = 6;
+  float clutter_rate    = 7;
+  float clutter_density = 8;
+  float prune_threshold   = 9;
+  float merge_threshold   = 10;
+  float extract_threshold = 11;
+  float gate_threshold    = 12;
+  uint32 max_components = 13;
+  float birth_weight = 14;
+  repeated float birth_mean              = 15 [(nanopb).max_count = 8];
+  repeated float birth_cov_diag          = 16 [(nanopb).max_count = 8];
+  repeated float process_noise_diag      = 17 [(nanopb).max_count = 8];
+  repeated float measurement_noise_diag  = 18 [(nanopb).max_count = 4];
+  // GGIW-only (filter_kind == FILTER_GGIW_PHD)
+  float eta = 30;
+  float tau = 31;
+  float rho = 32;
+  float birth_alpha = 33;
+  float birth_beta  = 34;
+  float birth_v     = 35;
+  repeated float birth_extent = 36 [(nanopb).max_count = 3];   // [Vxx, Vyy, Vxy]
+  // Trajectory-only (filter_kind == FILTER_TST_GM_PHD)
+  uint32 window_size = 50;
+  // Cap on PHD/GLMB extracted_mixtures history. 0 disables recording entirely
+  // (hardware-friendly default), N keeps the N most-recent snapshots.
+  uint32 max_history = 51;
+  // Trajectory-only: cap on each Trajectory's internal state_history buffer
+  // (Trajectory::set_max_history). Independent of window_size — the window
+  // sizes the filter's working set, trajectory_history sizes the long-term
+  // per-track record. 0 disables state history entirely.
+  uint32 trajectory_history = 52;
+}
+
+message Detection {
+  repeated float coords = 1 [(nanopb).max_count = 4];
+}
+
+message Step {
+  uint32 timestep = 1;
+  repeated Detection meas = 2 [(nanopb).max_count = 512];
+}
+
+message Track {
+  float weight = 1;
+  repeated float mean     = 2 [(nanopb).max_count = 8];
+  repeated float cov_diag = 3 [(nanopb).max_count = 8];
+  // GGIW-only
+  float alpha = 10;
+  float beta  = 11;
+  float v     = 12;
+  repeated float extent = 13 [(nanopb).max_count = 3];   // [Vxx, Vyy, Vxy]
+  // Labeled filters (GLMB, LMB, ...) populate this with a stable per-track id.
+  // Unlabeled filters (PHD, CPHD) leave it 0 — host groups by id when nonzero.
+  uint32 id = 14;
+  // Trajectory filters populate this with past mean states: flattened
+  // (n_past * state_dim) floats, oldest first. Current state is already in
+  // `mean` and is NOT duplicated here. Empty for non-trajectory filters.
+  // max_count=400 -> up to 100 past states at state_dim=4. The firmware
+  // truncates if a trajectory's internal history exceeds this.
+  repeated float history = 15 [(nanopb).max_count = 400];
+}
+
+message Tracks {
+  uint32 timestep = 1;
+  repeated Track tracks = 2 [(nanopb).max_count = 50];
+}
+
+message Log { string msg = 1 [(nanopb).max_size = 96]; }
+message Error { string msg = 1 [(nanopb).max_size = 96]; }
