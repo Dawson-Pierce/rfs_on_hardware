@@ -23,6 +23,7 @@
 #include "brew/core/filters/ekf.hpp"
 #include "brew/core/filters/ggiw_ekf.hpp"
 #include "brew/core/filters/trajectory_gaussian_ekf.hpp"
+#include "brew/core/filters/trajectory_ggiw_ekf.hpp"
 #include "brew/core/dynamics/single_integrator.hpp"
 #include "brew/core/models/gaussian.hpp"
 #include "brew/core/models/ggiw.hpp"
@@ -68,27 +69,36 @@ constexpr int STATE_DIM   = 4;    // [x, y, vx, vy]
 constexpr int SPATIAL_DIM = 2;    // [x, y]
 constexpr int MEAS_DIM    = 2;    // position-only
 
-using GaussD     = brew::models::Gaussian<double, STATE_DIM>;
-using GGIWD      = brew::models::GGIW<double, STATE_DIM, MEAS_DIM>;
-using TrajGauss  = brew::models::Trajectory<GaussD>;    // dynamic history
-using EKFD       = brew::filters::EKF<double, STATE_DIM>;
-using GGIWEKFD   = brew::filters::GGIWEKF<double, STATE_DIM, MEAS_DIM>;
-using TrajEKFD   = brew::filters::TrajectoryGaussianEKF<double, STATE_DIM>;
+using GaussD      = brew::models::Gaussian<double, STATE_DIM>;
+using EKFD        = brew::filters::EKF<double, STATE_DIM>;
+using PHDGauss    = brew::multi_target::PHD<GaussD>;
+using MixGauss    = brew::models::Mixture<GaussD>;
+
+using TrajGauss   = brew::models::Trajectory<GaussD>; 
+using TrajEKFD    = brew::filters::TrajectoryGaussianEKF<double, STATE_DIM>;
+using PHDTraj     = brew::multi_target::PHD<TrajGauss>;
+using MixTraj     = brew::models::Mixture<TrajGauss>;
+
+using GGIWD       = brew::models::GGIW<double, STATE_DIM, MEAS_DIM>;
+using GGIWEKFD    = brew::filters::GGIWEKF<double, STATE_DIM, MEAS_DIM>;
+using PHDGGIW     = brew::multi_target::PHD<GGIWD>;
+using MixGGIW     = brew::models::Mixture<GGIWD>;
+
+using TrajGGIW    = brew::models::Trajectory<GGIWD>; 
+using TrajGGIWEKF = brew::filters::TrajectoryGGIWEKF<double, STATE_DIM, MEAS_DIM>;
+using PHDGGIWTraj = brew::multi_target::PHD<TrajGGIW>;
+using MixGGIWTraj = brew::models::Mixture<TrajGGIW>;
+
 using DynaD      = brew::dynamics::SingleIntegrator<double, SPATIAL_DIM>;
-using MixGauss   = brew::models::Mixture<GaussD>;
-using MixGGIW    = brew::models::Mixture<GGIWD>;
-using MixTraj    = brew::models::Mixture<TrajGauss>;
-using PHDGauss   = brew::multi_target::PHD<GaussD>;
-using PHDGGIW    = brew::multi_target::PHD<GGIWD>;
-using PHDTraj    = brew::multi_target::PHD<TrajGauss>;
 
 namespace {
 
-std::unique_ptr<PHDGauss> g_tracker_gauss;
-std::unique_ptr<PHDGGIW>  g_tracker_ggiw;
-std::unique_ptr<PHDTraj>  g_tracker_tst;
-rfs_Config                g_cfg = rfs_Config_init_zero;
-bool                      g_have_cfg = false;
+std::unique_ptr<PHDGauss>     g_tracker_gauss;
+std::unique_ptr<PHDGGIW>      g_tracker_ggiw;
+std::unique_ptr<PHDTraj>      g_tracker_tst;
+std::unique_ptr<PHDGGIWTraj>  g_tracker_tst_ggiw;
+rfs_Config                    g_cfg = rfs_Config_init_zero;
+bool                          g_have_cfg = false;
 
 uint8_t payload_buf[MAX_PAYLOAD];
 uint8_t out_buf[MAX_PAYLOAD];
@@ -139,10 +149,11 @@ void rebuild_tracker_gauss(const rfs_Config& cfg) {
     for (int i = 0; i < MEAS_DIM; ++i) H(i, i) = 1.0;
     ekf->set_measurement_jacobian(H);
 
-    Eigen::MatrixXd Q = Eigen::MatrixXd::Zero(SPATIAL_DIM, SPATIAL_DIM);
+    Eigen::MatrixXd Q_small = Eigen::MatrixXd::Zero(SPATIAL_DIM, SPATIAL_DIM);
     for (int i = 0; i < SPATIAL_DIM && i < (int)cfg.process_noise_diag_count; ++i)
-        Q(i, i) = cfg.process_noise_diag[i];
-    ekf->set_process_noise(Q);
+        Q_small(i, i) = cfg.process_noise_diag[i];
+    Eigen::MatrixXd G = dyn->get_input_mat(1.0, DynaD::Vector::Zero());
+    ekf->set_process_noise(G * Q_small * G.transpose());
 
     Eigen::MatrixXd R = Eigen::MatrixXd::Zero(MEAS_DIM, MEAS_DIM);
     for (int i = 0; i < MEAS_DIM && i < (int)cfg.measurement_noise_diag_count; ++i)
@@ -177,6 +188,7 @@ void rebuild_tracker_gauss(const rfs_Config& cfg) {
     g_tracker_gauss = std::move(phd);
     g_tracker_ggiw.reset();
     g_tracker_tst.reset();
+    g_tracker_tst_ggiw.reset();
 }
 
 void rebuild_tracker_ggiw(const rfs_Config& cfg) {
@@ -188,10 +200,11 @@ void rebuild_tracker_ggiw(const rfs_Config& cfg) {
     for (int i = 0; i < MEAS_DIM; ++i) H(i, i) = 1.0;
     ekf->set_measurement_jacobian(H);
 
-    Eigen::MatrixXd Q = Eigen::MatrixXd::Zero(SPATIAL_DIM, SPATIAL_DIM);
+    Eigen::MatrixXd Q_small = Eigen::MatrixXd::Zero(SPATIAL_DIM, SPATIAL_DIM);
     for (int i = 0; i < SPATIAL_DIM && i < (int)cfg.process_noise_diag_count; ++i)
-        Q(i, i) = cfg.process_noise_diag[i];
-    ekf->set_process_noise(Q);
+        Q_small(i, i) = cfg.process_noise_diag[i];
+    Eigen::MatrixXd G = dyn->get_input_mat(1.0, DynaD::Vector::Zero());
+    ekf->set_process_noise(G * Q_small * G.transpose());
 
     Eigen::MatrixXd R = Eigen::MatrixXd::Zero(MEAS_DIM, MEAS_DIM);
     for (int i = 0; i < MEAS_DIM && i < (int)cfg.measurement_noise_diag_count; ++i)
@@ -240,6 +253,7 @@ void rebuild_tracker_ggiw(const rfs_Config& cfg) {
     g_tracker_ggiw = std::move(phd);
     g_tracker_gauss.reset();
     g_tracker_tst.reset();
+    g_tracker_tst_ggiw.reset();
 }
 
 void rebuild_tracker_tst(const rfs_Config& cfg) {
@@ -253,10 +267,11 @@ void rebuild_tracker_tst(const rfs_Config& cfg) {
     for (int i = 0; i < MEAS_DIM; ++i) H(i, i) = 1.0;
     ekf->set_measurement_jacobian(H);
 
-    Eigen::MatrixXd Q = Eigen::MatrixXd::Identity(STATE_DIM, STATE_DIM);
+    Eigen::MatrixXd Q_small = Eigen::MatrixXd::Zero(SPATIAL_DIM, SPATIAL_DIM);
     for (int i = 0; i < SPATIAL_DIM && i < (int)cfg.process_noise_diag_count; ++i)
-        Q(i, i) = cfg.process_noise_diag[i];
-    ekf->set_process_noise(Q);
+        Q_small(i, i) = cfg.process_noise_diag[i];
+    Eigen::MatrixXd G = dyn->get_input_mat(1.0, DynaD::Vector::Zero());
+    ekf->set_process_noise(G * Q_small * G.transpose());
 
     Eigen::MatrixXd R = Eigen::MatrixXd::Zero(MEAS_DIM, MEAS_DIM);
     for (int i = 0; i < MEAS_DIM && i < (int)cfg.measurement_noise_diag_count; ++i)
@@ -296,15 +311,84 @@ void rebuild_tracker_tst(const rfs_Config& cfg) {
     g_tracker_tst = std::move(phd);
     g_tracker_gauss.reset();
     g_tracker_ggiw.reset();
+    g_tracker_tst_ggiw.reset();
+}
+
+void rebuild_tracker_tst_ggiw(const rfs_Config& cfg) {
+    auto ekf = std::make_unique<TrajGGIWEKF>();
+    auto dyn = std::make_shared<DynaD>();
+    ekf->set_dynamics(dyn);
+    const int win = cfg.window_size > 0 ? (int)cfg.window_size : 3;
+    ekf->set_window_size(win);
+
+    Eigen::MatrixXd H = Eigen::MatrixXd::Zero(MEAS_DIM, STATE_DIM);
+    for (int i = 0; i < MEAS_DIM; ++i) H(i, i) = 1.0;
+    ekf->set_measurement_jacobian(H);
+
+    Eigen::MatrixXd Q_small = Eigen::MatrixXd::Zero(SPATIAL_DIM, SPATIAL_DIM);
+    for (int i = 0; i < SPATIAL_DIM && i < (int)cfg.process_noise_diag_count; ++i)
+        Q_small(i, i) = cfg.process_noise_diag[i];
+    Eigen::MatrixXd G = dyn->get_input_mat(1.0, DynaD::Vector::Zero());
+    ekf->set_process_noise(G * Q_small * G.transpose());
+
+    Eigen::MatrixXd R = Eigen::MatrixXd::Zero(MEAS_DIM, MEAS_DIM);
+    for (int i = 0; i < MEAS_DIM && i < (int)cfg.measurement_noise_diag_count; ++i)
+        R(i, i) = cfg.measurement_noise_diag[i];
+    ekf->set_measurement_noise(R);
+
+    ekf->set_temporal_decay(cfg.eta);
+    ekf->set_forgetting_factor(cfg.tau);
+    ekf->set_scaling_parameter(cfg.rho);
+
+    GaussD::Vector bm = GaussD::Vector::Zero();
+    for (int i = 0; i < STATE_DIM; ++i)
+        bm(i) = (i < (int)cfg.birth_mean_count) ? cfg.birth_mean[i] : 0.0;
+    GaussD::Matrix bc = GaussD::Matrix::Zero();
+    for (int i = 0; i < STATE_DIM; ++i)
+        bc(i, i) = (i < (int)cfg.birth_cov_diag_count) ? cfg.birth_cov_diag[i] : 1.0;
+
+    GGIWD::ExtentMatrix V0 = GGIWD::ExtentMatrix::Zero();
+    V0(0, 0) = (cfg.birth_extent_count > 0) ? cfg.birth_extent[0] : 1.0;
+    V0(1, 1) = (cfg.birth_extent_count > 1) ? cfg.birth_extent[1] : 1.0;
+    V0(0, 1) = (cfg.birth_extent_count > 2) ? cfg.birth_extent[2] : 0.0;
+    V0(1, 0) = V0(0, 1);
+
+    GGIWD initial(cfg.birth_alpha, cfg.birth_beta, bm, bc, cfg.birth_v, V0);
+    auto birth_traj = std::make_unique<TrajGGIW>(STATE_DIM, std::move(initial));
+    birth_traj->set_max_history(cfg.trajectory_history);
+    auto birth = std::make_unique<MixGGIWTraj>();
+    birth->add_component(std::move(birth_traj), cfg.birth_weight);
+    auto intensity = birth->clone();
+
+    auto phd = std::make_unique<PHDGGIWTraj>();
+    phd->set_filter(std::move(ekf));
+    phd->set_birth_model(std::move(birth));
+    phd->set_intensity(std::move(intensity));
+    phd->set_prob_detection(cfg.prob_detection);
+    phd->set_prob_survive(cfg.prob_survive);
+    phd->set_clutter_rate(cfg.clutter_rate);
+    phd->set_clutter_density(cfg.clutter_density);
+    phd->set_prune_threshold(cfg.prune_threshold);
+    phd->set_merge_threshold(cfg.merge_threshold);
+    phd->set_max_components(cfg.max_components);
+    phd->set_extract_threshold(cfg.extract_threshold);
+    phd->set_gate_threshold(cfg.gate_threshold);
+    phd->set_max_history(cfg.max_history);
+
+    g_tracker_tst_ggiw = std::move(phd);
+    g_tracker_gauss.reset();
+    g_tracker_ggiw.reset();
+    g_tracker_tst.reset();
 }
 
 void rebuild_tracker(const rfs_Config& cfg) {
     g_cfg = cfg;
     g_have_cfg = true;
     switch (cfg.filter_kind) {
-        case rfs_FilterKind_FILTER_GGIW_PHD:   rebuild_tracker_ggiw(cfg);  break;
-        case rfs_FilterKind_FILTER_TST_GM_PHD: rebuild_tracker_tst(cfg);   break;
-        default:                               rebuild_tracker_gauss(cfg); break;
+        case rfs_FilterKind_FILTER_GGIW_PHD:     rebuild_tracker_ggiw(cfg);     break;
+        case rfs_FilterKind_FILTER_TST_GM_PHD:   rebuild_tracker_tst(cfg);      break;
+        case rfs_FilterKind_FILTER_TST_GGIW_PHD: rebuild_tracker_tst_ggiw(cfg); break;
+        default:                                 rebuild_tracker_gauss(cfg);    break;
     }
 }
 
@@ -336,6 +420,26 @@ int purge_nan_ggiw(Mix& mix) {
             c.covariance().array().isFinite().all() &&
             std::isfinite(c.alpha()) && std::isfinite(c.beta()) &&
             std::isfinite(c.v()) && c.V().array().isFinite().all();
+        if (!finite) bad.push_back(i);
+    }
+    if (!bad.empty()) mix.remove_components(bad);
+    return (int)bad.size();
+}
+
+template <typename Mix>
+int purge_nan_tst_ggiw(Mix& mix) {
+    // Mix = Mixture<Trajectory<GGIW>>. The stacked mean/cov are the trajectory
+    // blocks; GGIW shape parameters live on the current() inner dist.
+    std::vector<std::size_t> bad;
+    for (std::size_t i = 0; i < mix.size(); ++i) {
+        const auto& traj = mix.component(i);
+        const auto& g = traj.current();
+        const bool finite =
+            std::isfinite(mix.weight(i)) &&
+            traj.mean().array().isFinite().all() &&
+            traj.covariance().array().isFinite().all() &&
+            std::isfinite(g.alpha()) && std::isfinite(g.beta()) &&
+            std::isfinite(g.v()) && g.V().array().isFinite().all();
         if (!finite) bad.push_back(i);
     }
     if (!bad.empty()) mix.remove_components(bad);
@@ -459,6 +563,55 @@ void emit_tracks_tst(uint16_t seq, uint32_t timestep) {
     send_pb(MSG_TRACKS, seq, rfs_Tracks_fields, msg);
 }
 
+void emit_tracks_tst_ggiw(uint16_t seq, uint32_t timestep) {
+    const auto& extracted = g_tracker_tst_ggiw->extracted_mixtures();
+    const MixGGIWTraj* est = extracted.empty() ? nullptr : extracted.back().get();
+    rfs_Tracks msg = rfs_Tracks_init_zero;
+    msg.timestep = timestep;
+    const int sd = g_cfg.state_dim;
+    if (est) {
+        const int n = std::min<int>((int)est->size(),
+                                    (int)(sizeof(msg.tracks) / sizeof(msg.tracks[0])));
+        msg.tracks_count = n;
+        const int hist_cap = (int)(sizeof(msg.tracks[0].history)
+                                   / sizeof(msg.tracks[0].history[0]));
+        const int kdim = std::min(sd, 8);
+        for (int i = 0; i < n; ++i) {
+            msg.tracks[i] = rfs_Track_init_zero;
+            msg.tracks[i].weight = (float)est->weight(i);
+            const auto& traj = est->component(i);
+            fill_track_kinematics(msg.tracks[i], traj.get_last_state(), traj.get_last_cov(), sd);
+
+            // GGIW shape from the trajectory's current inner marginal.
+            const auto& g = traj.current();
+            msg.tracks[i].alpha = (float)g.alpha();
+            msg.tracks[i].beta  = (float)g.beta();
+            msg.tracks[i].v     = (float)g.v();
+            const auto& V = g.V();
+            if (V.rows() >= 2 && V.cols() >= 2) {
+                msg.tracks[i].extent_count = 3;
+                msg.tracks[i].extent[0] = (float)V(0, 0);
+                msg.tracks[i].extent[1] = (float)V(1, 1);
+                msg.tracks[i].extent[2] = (float)V(0, 1);
+            }
+
+            // Past kinematic states, oldest first, skipping the birth seed
+            // entry for the same reason as emit_tracks_tst (birth mean polyline
+            // artifact).
+            const auto& sh = traj.state_history();
+            int out = 0;
+            for (std::size_t h = 1; h < sh.size() && out + kdim <= hist_cap; ++h) {
+                const auto& sg = sh[h];
+                for (int k = 0; k < kdim; ++k) {
+                    msg.tracks[i].history[out++] = (float)sg.mean()(k);
+                }
+            }
+            msg.tracks[i].history_count = out;
+        }
+    }
+    send_pb(MSG_TRACKS, seq, rfs_Tracks_fields, msg);
+}
+
 void handle_step(uint16_t seq, const uint8_t* payload, uint16_t plen) {
     rfs_Step step = rfs_Step_init_zero;
     pb_istream_t is = pb_istream_from_buffer(payload, plen);
@@ -491,6 +644,13 @@ void handle_step(uint16_t seq, const uint8_t* payload, uint16_t plen) {
         dropped = purge_nan_gauss(g_tracker_tst->intensity());
         g_tracker_tst->cleanup();
         emit_tracks_tst(seq, step.timestep);
+    } else if (g_tracker_tst_ggiw) {
+        Eigen::MatrixXd Z = load_meas(step, md);
+        g_tracker_tst_ggiw->predict((int)step.timestep, (double)g_cfg.dt);
+        if (step.meas_count > 0) g_tracker_tst_ggiw->correct(Z);
+        dropped = purge_nan_tst_ggiw(g_tracker_tst_ggiw->intensity());
+        g_tracker_tst_ggiw->cleanup();
+        emit_tracks_tst_ggiw(seq, step.timestep);
     } else {
         send_error(seq, "no tracker; send CONFIG first");
         return;
@@ -513,6 +673,7 @@ void dispatch(uint8_t type, uint16_t seq, const uint8_t* payload, uint16_t plen)
             g_tracker_gauss.reset();
             g_tracker_ggiw.reset();
             g_tracker_tst.reset();
+            g_tracker_tst_ggiw.reset();
             send_log(seq, "tracker reset");
             break;
         case MSG_CONFIG: {
@@ -523,9 +684,10 @@ void dispatch(uint8_t type, uint16_t seq, const uint8_t* payload, uint16_t plen)
                 break;
             }
             rebuild_tracker(cfg);
-            const char* tag = g_tracker_ggiw ? "tracker built (GGIW-PHD)"
-                            : g_tracker_tst  ? "tracker built (TST-GM-PHD)"
-                                             : "tracker built (GM-PHD)";
+            const char* tag = g_tracker_ggiw     ? "tracker built (GGIW-PHD)"
+                            : g_tracker_tst      ? "tracker built (TST-GM-PHD)"
+                            : g_tracker_tst_ggiw ? "tracker built (TST-GGIW-PHD)"
+                                                 : "tracker built (GM-PHD)";
             send_log(seq, tag);
             break;
         }

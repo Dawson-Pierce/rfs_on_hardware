@@ -12,9 +12,10 @@ import "nanopb.proto";
 // PING / PONG / RESET use empty payloads; the others use the messages below.
 
 enum FilterKind {
-  FILTER_GM_PHD     = 0;
-  FILTER_GGIW_PHD   = 1;
-  FILTER_TST_GM_PHD = 2;
+  FILTER_GM_PHD       = 0;
+  FILTER_GGIW_PHD     = 1;
+  FILTER_TST_GM_PHD   = 2;
+  FILTER_TST_GGIW_PHD = 3;
 }
 
 message Config {

@@ -95,7 +95,8 @@ def detections_extended(truth_step, pd, meas_rate, clutter_lambda, extent_std,
 
 def build_config(args):
     kind = {"gm": pb.FILTER_GM_PHD, "ggiw": pb.FILTER_GGIW_PHD,
-            "tst": pb.FILTER_TST_GM_PHD}[args.filter]
+            "tst": pb.FILTER_TST_GM_PHD,
+            "tst_ggiw": pb.FILTER_TST_GGIW_PHD}[args.filter]
     cfg = pb.Config(
         filter_kind=kind, state_dim=4, meas_dim=2,
         dt=args.dt, prob_detection=args.pd, prob_survive=0.99,
@@ -122,7 +123,7 @@ def run(args):
     truth = make_scenario(args.targets, args.steps, args.dt, args.fov, rng,
                           degree=args.degree)
     cfg = build_config(args)
-    is_ggiw = (args.filter == "ggiw")
+    is_ggiw = args.filter in ("ggiw", "tst_ggiw")
 
     plt.ion()
     fig, ax = plt.subplots(figsize=(9, 9))
@@ -148,9 +149,13 @@ def run(args):
 
     track_lines: dict[int, tuple] = {}
     extent_patches: list[Ellipse] = []
+    ci_patches: list[Ellipse] = []
     traj_lines: list = []   # TST per-step trajectory polylines (cleared each step)
+    # Mahalanobis radius for a 2D Gaussian 95% confidence region:
+    # sqrt(chi2.ppf(0.95, df=2)) ≈ 2.4477.
+    ci_scale = float(np.sqrt(5.991464547107979))
     cmap = plt.get_cmap("tab20")
-    is_tst = (args.filter == "tst")
+    is_tst = args.filter in ("tst", "tst_ggiw")
     state_dim = 4
 
     link = Link(args.port, baud=args.baud)
@@ -205,11 +210,13 @@ def run(args):
                 xs.append(float(t.mean[0])); ys.append(float(t.mean[1]))
                 ln.set_data(xs, ys)
 
-            # TST: draw each extracted trajectory as history+current polyline.
-            # NOT cleared between steps so each step's short window-polyline
-            # overlaps with the previous ones, accumulating into the full
-            # trajectory since birth. The wire only carries the window; the
-            # full history lives in this accumulated drawing.
+            # TST: draw each extracted trajectory as a history+current polyline
+            # for the current step only. Cleared each step so the plot reflects
+            # just the latest extraction rather than accumulating every past
+            # window on top of itself.
+            for ln in traj_lines:
+                ln.remove()
+            traj_lines.clear()
             if is_tst:
                 for t in tracks:
                     if len(t.mean) < 2:
@@ -223,13 +230,17 @@ def run(args):
                     pts_x.append(float(t.mean[0]))
                     pts_y.append(float(t.mean[1]))
                     if len(pts_x) >= 2:
-                        ax.plot(pts_x, pts_y, "-",
-                                color="#ff0000", lw=1.2,
-                                alpha=0.35, zorder=10)
+                        ln, = ax.plot(pts_x, pts_y, "-",
+                                      color="#ff0000", lw=1.2,
+                                      alpha=0.35, zorder=10)
+                        traj_lines.append(ln)
 
             for p in extent_patches:
                 p.remove()
             extent_patches.clear()
+            for p in ci_patches:
+                p.remove()
+            ci_patches.clear()
             if is_ggiw:
                 for t in tracks:
                     if t.v > 4.0 and len(t.extent) >= 3 and len(t.mean) >= 2:
@@ -247,6 +258,20 @@ def run(args):
                         ax.add_patch(ell)
                         extent_patches.append(ell)
 
+                    # Position 95% CI from the kinematic covariance. cov_diag
+                    # is diagonal-only (that's all the firmware ships), so the
+                    # ellipse is axis-aligned.
+                    if len(t.cov_diag) >= 2 and len(t.mean) >= 2:
+                        sx = np.sqrt(max(float(t.cov_diag[0]), 0.0))
+                        sy = np.sqrt(max(float(t.cov_diag[1]), 0.0))
+                        ci = Ellipse((t.mean[0], t.mean[1]),
+                                     2 * ci_scale * sx, 2 * ci_scale * sy,
+                                     angle=0.0, fill=False,
+                                     edgecolor="g", linestyle="--",
+                                     alpha=0.6)
+                        ax.add_patch(ci)
+                        ci_patches.append(ci)
+
             title.set_text(f"step {k:4d}  dets={len(dets)}  tracks={len(tracks)}")
             fig.canvas.draw_idle()
             plt.pause(args.frame_delay)
@@ -260,7 +285,7 @@ def run(args):
 
 def main():
     p = argparse.ArgumentParser(description="rfs_on_teensy Chebyshev sim harness")
-    p.add_argument("--port", help="Serial port (required unless --preview-truth)") 
+    p.add_argument("--port", help="Serial port") 
     p.add_argument("--baud", type=int, default=115200)
     p.add_argument("--steps", type=int, default=100)
     p.add_argument("--targets", type=int, default=3)
@@ -268,7 +293,7 @@ def main():
     p.add_argument("--dt", type=float, default=0.05)
     p.add_argument("--fov", type=float, default=100.0)
     p.add_argument("--pd", type=float, default=0.95)
-    p.add_argument("--q", type=float, default=1,
+    p.add_argument("--q", type=float, default=0.3,
                    help="Process noise std^2 per axis (bump vs circles: paths are wilder)")
     p.add_argument("--r", type=float, default=0.5,
                    help="Filter's measurement noise variance per axis "
@@ -279,17 +304,19 @@ def main():
                    help="Scenario noise std used when sampling detections "
                         "around truth. Independent of --r.")
     p.add_argument("--seed", type=int, default=0)
-    p.add_argument("--filter", choices=["gm", "ggiw", "tst"], default="gm")
-    p.add_argument("--meas-rate", type=float, default=8.0)
-    p.add_argument("--extent-std", type=float, default=2.0)
-    p.add_argument("--window", type=int, default=2)
-    p.add_argument("--max-history", type=int, default=10,
+    p.add_argument("--filter", choices=["gm", "ggiw", "tst", "tst_ggiw"], default="gm")
+    p.add_argument("--meas-rate", type=float, default=20.0)
+    p.add_argument("--extent-std", type=float, default=0.5)
+    p.add_argument("--window", type=int, default=3)
+    p.add_argument("--max-history", type=int, default=1,
                    help="Cap on PHD/GLMB extracted-mixtures deque. 0 = no "
                         "recording (zero-growth), N = keep N latest.")
     p.add_argument("--traj-history", type=int, default=10,
                    help="TST-only: per-Trajectory state_history cap "
                         "(independent of --window). 0 disables, N keeps N "
-                        "most-recent states per trajectory.")
+                        "most-recent states per trajectory "
+                        "the protobuf history buffer (400 floats / state_dim=4 "
+                        "= 100 states including the current one).")
     p.add_argument("--max_components", type=int, default=10)
     p.add_argument("--degree", type=int, default=2,
                    help="Chebyshev polynomial degree per axis per target")
